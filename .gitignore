@@ -1,0 +1,8 @@
+Data/
+venv/
+.env
+.ipynb_checkpoints/
+*.zip
+.DS_Store
+Thumbs.db
+.vscode/
