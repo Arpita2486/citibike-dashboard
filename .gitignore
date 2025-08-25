@@ -1,10 +1,5 @@
 Data/
-venv/
-.env
-.ipynb_checkpoints/
-*.zip
-.DS_Store
-Thumbs.db
-.vscode/
 Output/*.gz
-Untitled*.ipynb
+.env
+venv/
+.ipynb_checkpoints/
