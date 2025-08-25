@@ -3,3 +3,7 @@ Output/*.gz
 .env
 venv/
 .ipynb_checkpoints/
+Output/*.gz
+.env
+venv/
+.ipynb_checkpoints/
