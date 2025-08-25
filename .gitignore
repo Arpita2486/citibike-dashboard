@@ -1,8 +1,7 @@
 Data/
-Output/*.gz
-.env
-venv/
-.ipynb_checkpoints/
+Output/*.csv
+Output/*.zip
+Output/*.parquet
 Output/*.gz
 .env
 venv/
