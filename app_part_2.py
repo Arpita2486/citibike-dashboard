@@ -44,10 +44,14 @@ def load_sample():
 
     df = pd.read_csv(SAMPLE, low_memory=False)
 
-    # Clean types
+    # Parse date
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if "avgTemp" in df.columns:
-        df["avgTemp"] = pd.to_numeric(df["avgTemp"], errors="coerce")
+
+    # Ensure numeric types for key columns if present
+    for c in ["start_lat", "start_lng", "end_lat", "end_lng"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     for c in ["start_station_name", "end_station_name", "member_casual"]:
         if c in df.columns:
             df[c] = df[c].fillna({
@@ -56,10 +60,27 @@ def load_sample():
                 "member_casual": "unknown"
             }[c])
 
-    # Ensure coords numeric if present
-    for c in ["start_lat", "start_lng", "end_lat", "end_lng"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # ---- Ensure we have weather + create avgTempC in °C (fix NOAA tenths-of-°C) ----
+    # If avgTemp is missing or all NaN, try merging weather from Output/laguardia_weather_2022.csv
+    if "avgTemp" not in df.columns or df["avgTemp"].isna().all():
+        wpath = OUT / "laguardia_weather_2022.csv"
+        if wpath.exists():
+            w = pd.read_csv(wpath)
+            w["date"] = pd.to_datetime(w["date"], errors="coerce")
+            w["avgTemp"] = pd.to_numeric(w["avgTemp"], errors="coerce")
+            df = df.merge(w[["date", "avgTemp"]], on="date", how="left")
+        else:
+            df["avgTemp"] = np.nan
+
+    # Create avgTempC (Celsius). NOAA daily TAVG often stored in tenths of °C.
+    if "avgTemp" in df.columns:
+        med = df["avgTemp"].dropna().astype(float).abs().median()
+        if pd.notna(med) and med <= 6:  # looks like tenths-of-°C → multiply
+            df["avgTempC"] = df["avgTemp"].astype(float) * 10.0
+        else:
+            df["avgTempC"] = df["avgTemp"].astype(float)
+    else:
+        df["avgTempC"] = np.nan
 
     # Date bounds
     min_date = pd.to_datetime(df["date"].min()).date()
@@ -91,7 +112,7 @@ page = st.sidebar.selectbox(
 st.sidebar.title("Filters")
 rider_opt = st.sidebar.radio("Rider type", ["All", "member", "casual"], index=0)
 topN = st.sidebar.slider("Top N stations", 10, 40, 20, 2)
-smooth = st.sidebar.checkbox("Use 7-day smoothing (Trends)", value=True)
+smooth_checkbox_default = True  # default smoothing
 
 # Date range (global)
 default_range = (MIN_DATE, MAX_DATE)
@@ -103,7 +124,7 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     START_DATE = END_DATE = date_range
 
-show_debug = st.sidebar.checkbox("Show debug data (Trends/Helper)", value=False)
+show_debug = st.sidebar.checkbox("Show debug data (Helper)", value=False)
 
 # Apply global filters
 dff = df if rider_opt == "All" else df[df["member_casual"] == rider_opt]
@@ -114,7 +135,7 @@ dff = dff.loc[mask].copy()
 def kpi_strip(d):
     c1, c2, c3, c4, c5 = st.columns(5)
     total_trips = len(d)
-    avg_temp = (d["avgTemp"].mean() if "avgTemp" in d.columns else np.nan)
+    avg_tempC = (d["avgTempC"].mean() if "avgTempC" in d.columns else np.nan)
     member_share = (
         (d["member_casual"].eq("member").mean() * 100.0)
         if "member_casual" in d.columns else np.nan
@@ -124,7 +145,7 @@ def kpi_strip(d):
         if "start_station_name" in d.columns and not d["start_station_name"].empty else "—"
     )
 
-    # Prior window comparison
+    # Prior window comparison (simple)
     days = max((END_DATE - START_DATE).days + 1, 1)
     prior_start = START_DATE - pd.Timedelta(days=days)
     prior_end = START_DATE - pd.Timedelta(days=1)
@@ -132,62 +153,16 @@ def kpi_strip(d):
     df_prior = df.loc[prior_mask]
     prior_trips = len(df_prior)
 
-    delta = (total_trips - prior_trips) if prior_trips else total_trips
+    delta = (total_trips - prior_trips) if prior_trips else np.nan
     delta_pct = (delta / prior_trips * 100.0) if prior_trips else np.nan
 
-    c1.metric("Trips (selected)", f"{total_trips:,}", delta=(f"{delta:+,}" if not np.isnan(delta) else "—"))
+    c1.metric("Trips (selected)", f"{total_trips:,}", delta=(f"{int(delta):+d}" if not np.isnan(delta) else "—"))
     c2.metric("Δ vs prior window", (f"{delta_pct:+.1f}%" if not np.isnan(delta_pct) else "—"))
-    c3.metric("Avg Temp (°C)", f"{avg_temp:.1f}" if not np.isnan(avg_temp) else "—")
+    c3.metric("Avg Temp (°C)", f"{avg_tempC:.1f}" if not np.isnan(avg_tempC) else "—")
     c4.metric("Member share", f"{member_share:.1f}%" if not np.isnan(member_share) else "—")
     c5.metric("Top start station", top_station)
 
 # ---------------- Helper functions ----------------
-def daily_trips_temp(d):
-    d2 = d.copy()
-    d2["date"] = pd.to_datetime(d2["date"], errors="coerce")
-
-    # Ensure avgTemp; fallback to weather CSV if present
-    if "avgTemp" not in d2.columns or d2["avgTemp"].isna().all():
-        wpath = OUT / "laguardia_weather_2022.csv"
-        if wpath.exists():
-            w = pd.read_csv(wpath)
-            w["date"] = pd.to_datetime(w["date"], errors="coerce")
-            w["avgTemp"] = pd.to_numeric(w["avgTemp"], errors="coerce")
-            d2 = d2.merge(w, on="date", how="left", suffixes=("", "_w"))
-            if "avgTemp_w" in d2.columns and d2["avgTemp"].isna().all():
-                d2["avgTemp"] = d2["avgTemp_w"]
-        else:
-            d2["avgTemp"] = np.nan
-
-    key = d2["date"].dt.date.rename("date")
-    daily_trips = d2.groupby(key).size().reset_index(name="trip_count")
-    daily_temp = d2.groupby(key)["avgTemp"].mean().reset_index()
-    d_daily = daily_trips.merge(daily_temp, on="date", how="left").sort_values("date")
-    d_daily["date"] = pd.to_datetime(d_daily["date"], errors="coerce")
-    return d_daily
-
-def plot_trips_vs_temp(d_daily, smooth=True):
-    if smooth:
-        d_daily["trip_plot"] = d_daily["trip_count"].rolling(7, min_periods=1).mean()
-        d_daily["temp_plot"] = d_daily["avgTemp"].rolling(7, min_periods=1).mean()
-    else:
-        d_daily["trip_plot"] = d_daily["trip_count"]
-        d_daily["temp_plot"] = d_daily["avgTemp"]
-
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=d_daily["date"], y=d_daily["trip_plot"], mode="lines", name="Trips"), secondary_y=False)
-    if d_daily["temp_plot"].notna().any():
-        fig.add_trace(go.Scatter(x=d_daily["date"], y=d_daily["temp_plot"], mode="lines", name="Avg Temp (°C)"), secondary_y=True)
-    fig.update_yaxes(title_text="Trips", secondary_y=False)
-    fig.update_yaxes(title_text="Avg Temp (°C)", secondary_y=True)
-    fig.update_layout(
-        xaxis=dict(type="date", rangeslider=dict(visible=True)),
-        hovermode="x unified",
-        height=520, margin=dict(t=10, b=20, l=60, r=60),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0)
-    )
-    return fig
-
 def aggregate_flows(d, month=None, quantile=0.95):
     """Aggregate OD flows; filter by month and quantile threshold."""
     x = d.copy()
@@ -294,11 +269,7 @@ def decision_helper(d):
     # Waterfront station need (heuristic)
     d2 = d.copy()
     if all(c in d2.columns for c in ["start_lng","end_lng"]):
-        res = aggregate_flows(d2, month=None, quantile=0.95)
-        if isinstance(res, tuple):
-            flows, thr = res
-        else:
-            flows, thr = res, None
+        flows, thr = aggregate_flows(d2, month=None, quantile=0.95)
         if flows is not None and not flows.empty:
             wf_flows = flows[(flows["start_lng"].apply(is_waterfront_station)) |
                              (flows["end_lng"].apply(is_waterfront_station))]
@@ -343,9 +314,6 @@ def page_intro():
         """
     )
 
-import plotly.graph_objects as go
-import plotly.express as px
-
 def page_trends():
     st.header("Trends: Daily Trips vs Temperature (Data-driven)")
 
@@ -372,8 +340,8 @@ def page_trends():
                        .reset_index(drop=True))
 
     # ---- Smoothing toggle ----
-    smooth = st.checkbox("Apply 7-day smoothing", value=True)
-    if smooth:
+    smooth_on = st.checkbox("Apply 7-day smoothing", value=True)
+    if smooth_on:
         daily["trip_s"] = daily["trip_count"].rolling(7, min_periods=1).mean()
         daily["temp_s"] = daily["avgTempC"].rolling(7, min_periods=1).mean()
         y_trips = "trip_s"
@@ -417,18 +385,12 @@ def page_trends():
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---- Data-driven interpretation (only from this dataset) ----
+    # ---- Show only facts (no narrative text) ----
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Correlation (trips ↔ temp)", "—" if np.isnan(corr) else f"{corr:+.2f}")
     c2.metric("Avg daily trips (Nov–Apr)", "—" if np.isnan(winter_avg) else f"{int(round(winter_avg)):,}")
     c3.metric("Avg daily trips (May–Oct)", "—" if np.isnan(summer_avg) else f"{int(round(summer_avg)):,}")
     c4.metric("Winter/Summer ratio", "—" if np.isnan(ratio) else f"{ratio:.2f}")
-
-    st.markdown(
-        """
-        """
-    )
-
 
 def page_stations_top():
     st.header(f"Top Starting Stations  —  {'all riders' if rider_opt=='All' else rider_opt}")
@@ -442,12 +404,6 @@ def page_stations_top():
     fig.update_traces(textposition="outside", cliponaxis=False)
     fig.update_layout(height=620, margin=dict(t=10, b=20, l=160, r=20), showlegend=False, bargap=0.2)
     st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        """
-        **Interpretation:** These are persistent **demand hotspots**. Prioritize **stocking**, **valet staffing** on peak days, and **nearby capacity expansion**.
-        """
-    )
 
 def page_stations_imbalance():
     st.header(f"Stations Imbalance (starts − ends)  —  {'all riders' if rider_opt=='All' else rider_opt}")
@@ -482,14 +438,6 @@ def page_stations_imbalance():
         fig2.update_layout(height=500, margin=dict(l=160, r=20, t=20, b=20), showlegend=False)
         st.plotly_chart(fig2, use_container_width=True)
 
-    st.markdown(
-        """
-        **How to use:**  
-        - **Exporters** (positive net) empty out → schedule **inbound** rebalancing or nudge returns to them.  
-        - **Importers** (negative net) fill up → ensure **dock availability** and **valet** during peaks.
-        """
-    )
-
 def page_map_inline():
     st.header("Origin → Destination Flows (Inline Folium)")
     kpi_strip(dff)
@@ -504,12 +452,7 @@ def page_map_inline():
     quant = st.slider("Flow threshold (quantile)", 0.80, 0.99, 0.95, 0.01)
 
     month_arg = None if sel_month == "All" else sel_month
-    res = aggregate_flows(dff, month=month_arg, quantile=quant)
-    if isinstance(res, tuple) and len(res) == 2:
-        flows, thr = res
-    else:
-        flows, thr = res, None
-
+    flows, thr = aggregate_flows(dff, month=month_arg, quantile=quant)
     if flows is None or flows.empty:
         st.warning("No flows match the current filters.")
         return
@@ -522,13 +465,6 @@ def page_map_inline():
     html = m.get_root().render()
     components.html(html, height=900, scrolling=True)
     st.caption(f"Showing flows ≥ {int(thr) if thr is not None else 'threshold'} trips (quantile={quant:.2f}).")
-
-    st.markdown(
-        """
-        **Interpretation:** Strong, repeated **OD corridors** emerge (Midtown spine, waterfront edges, park connectors).
-        Use these corridors to plan **rebalancing routes** and identify **station densification** opportunities.
-        """
-    )
 
 def page_map_embedded():
     st.header("Origin → Destination Flows (Embedded HTML)")
@@ -570,13 +506,6 @@ def page_bonus():
     fig = px.area(mix, x="month", y="trips", color="member_casual", category_orders={"month":order})
     fig.update_layout(height=520, margin=dict(t=10, b=20, l=40, r=20), legend_title_text="Rider type")
     st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        """
-        **Why this matters:** Casual share spikes in warm months and weekends, stressing stocking and docks.
-        Plan **surge capacity** and **return incentives** accordingly.
-        """
-    )
 
 def page_decision_helper():
     st.header("Decision Helper — From Data to Actions")
