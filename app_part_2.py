@@ -343,28 +343,92 @@ def page_intro():
         """
     )
 
-def page_trends():
-    st.header(f"Daily Trips vs Temperature  —  {'all riders' if rider_opt=='All' else rider_opt}")
-    kpi_strip(dff)
+import plotly.graph_objects as go
+import plotly.express as px
 
-    d_daily = daily_trips_temp(dff)
-    if d_daily.empty:
-        st.warning("No daily data available.")
+def page_trends():
+    st.header("Trends: Daily Trips vs Temperature (Data-driven)")
+
+    # Use the globally filtered dataframe dff (set by your sidebar filters)
+    if dff.empty:
+        st.warning("No rows match the current filters.")
         return
 
-    fig = plot_trips_vs_temp(d_daily, smooth=smooth)
+    # ---- Aggregate daily trips from the filtered slice ----
+    daily_trips = (
+        dff.groupby("date")
+           .size()
+           .rename("trip_count")
+           .reset_index()
+    )
+    # One temperature per day (already attached to trips); dedupe per date
+    temps = (
+        dff[["date", "avgTempC"]]
+        .dropna(subset=["date"])
+        .drop_duplicates(subset=["date"])
+    )
+    daily = (daily_trips.merge(temps, on="date", how="left")
+                       .sort_values("date")
+                       .reset_index(drop=True))
+
+    # ---- Smoothing toggle ----
+    smooth = st.checkbox("Apply 7-day smoothing", value=True)
+    if smooth:
+        daily["trip_s"] = daily["trip_count"].rolling(7, min_periods=1).mean()
+        daily["temp_s"] = daily["avgTempC"].rolling(7, min_periods=1).mean()
+        y_trips = "trip_s"
+        y_temp  = "temp_s"
+        trips_label = "Trips (7-day avg)"
+        temp_label  = "Avg Temp (°C, 7-day avg)"
+    else:
+        y_trips = "trip_count"
+        y_temp  = "avgTempC"
+        trips_label = "Trips (daily)"
+        temp_label  = "Avg Temp (°C, daily)"
+
+    # ---- Correlation & seasonality stats (based on current filtered view) ----
+    corr = (daily[[y_trips, y_temp]].dropna().corr().iloc[0,1]
+            if daily[y_temp].notna().any() else np.nan)
+
+    daily["month"] = pd.to_datetime(daily["date"]).dt.month
+    winter = daily[daily["month"].isin([11,12,1,2,3,4])]
+    summer = daily[daily["month"].isin([5,6,7,8,9,10])]
+    winter_avg = float(winter["trip_count"].mean()) if not winter.empty else np.nan
+    summer_avg = float(summer["trip_count"].mean()) if not summer.empty else np.nan
+    ratio = (winter_avg / summer_avg) if (summer_avg and not np.isnan(summer_avg)) else np.nan
+
+    # ---- Plotly dual-axis chart ----
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily["date"], y=daily[y_trips],
+        name=trips_label, mode="lines"
+    ))
+    fig.add_trace(go.Scatter(
+        x=daily["date"], y=daily[y_temp],
+        name=temp_label, mode="lines", yaxis="y2"
+    ))
+    fig.update_layout(
+        title="Daily Trips vs Temperature",
+        xaxis=dict(title="Date", rangeslider=dict(visible=True)),
+        yaxis=dict(title="Trips"),
+        yaxis2=dict(title="Temperature (°C)", overlaying="y", side="right"),
+        margin=dict(l=60, r=60, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    )
     st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Data-driven interpretation (only from this dataset) ----
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Correlation (trips ↔ temp)", "—" if np.isnan(corr) else f"{corr:+.2f}")
+    c2.metric("Avg daily trips (Nov–Apr)", "—" if np.isnan(winter_avg) else f"{int(round(winter_avg)):,}")
+    c3.metric("Avg daily trips (May–Oct)", "—" if np.isnan(summer_avg) else f"{int(round(summer_avg)):,}")
+    c4.metric("Winter/Summer ratio", "—" if np.isnan(ratio) else f"{ratio:.2f}")
 
     st.markdown(
         """
-        **Interpretation:** Trips peak in warmer months and dip during colder months, revealing strong seasonality and temperature sensitivity.
-        Use the range slider to zoom to specific periods (e.g., Nov–Apr vs May–Oct) to size seasonal supply.
         """
     )
-    if show_debug:
-        with st.expander("Debug (first rows of daily aggregates)"):
-            st.write(d_daily.head())
-            st.write(d_daily.dtypes)
+
 
 def page_stations_top():
     st.header(f"Top Starting Stations  —  {'all riders' if rider_opt=='All' else rider_opt}")
