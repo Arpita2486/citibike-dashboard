@@ -537,7 +537,7 @@ def page_decision_helper():
         )
         st.success(
             f"**Recommendation:** Pilot **{wf['suggested_new_stations']}** new docks along the waterfront "
-            "in the hottest segments (see Map pages). Keep any site exceeding **6–8 trips/dock/day** in season."
+            "in the hottest segments. Keep any site exceeding **6–8 trips/dock/day** in season."
         )
     else:
         st.warning("Could not derive shoreline suggestion (coords missing or no strong flows). Use the Map pages to inspect corridors.")
@@ -556,7 +556,7 @@ def page_decision_helper():
             st.dataframe(importers, use_container_width=True, hide_index=True)
 
         st.success(
-            "**Playbook:** Predictive hourly rebalancing along strong **corridors** (see Map), "
+            "**Playbook:** Predictive hourly rebalancing along strong **corridors**, "
             "**dock-reserve windows** at top importers, **valet** on peak days, and **in-app return incentives** "
             "to nudge riders toward under-stocked docks."
         )
