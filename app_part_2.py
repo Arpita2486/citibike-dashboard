@@ -19,6 +19,7 @@ except Exception:
 
 st.set_page_config(page_title="NYC Citi Bike 2022 — Final Dashboard", layout="wide")
 
+
 # ---------------- Data loader ----------------
 @st.cache_data(show_spinner=False)
 def load_sample():
@@ -82,15 +83,28 @@ def load_sample():
     else:
         df["avgTempC"] = np.nan
 
+    # Build a GLOBAL daily temperature table (unique value per calendar day)
+    temp_daily = (
+        df.loc[:, ["date", "avgTempC"]]
+          .dropna(subset=["date"])
+          .assign(day=lambda x: x["date"].dt.date)
+          .groupby("day")["avgTempC"].mean()
+          .reset_index()
+          .rename(columns={"day": "date"})
+    )
+    temp_daily["date"] = pd.to_datetime(temp_daily["date"])
+
     # Date bounds
     min_date = pd.to_datetime(df["date"].min()).date()
     max_date = pd.to_datetime(df["date"].max()).date()
-    return df, OUT, min_date, max_date, None
+    return df, temp_daily, OUT, min_date, max_date, None
 
-df, OUT, MIN_DATE, MAX_DATE, err = load_sample()
+
+df, TEMP_DAILY, OUT, MIN_DATE, MAX_DATE, err = load_sample()
 if err:
     st.error(err)
     st.stop()
+
 
 # ---------------- Sidebar: page navigation + global filters ----------------
 st.sidebar.title("Navigation")
@@ -112,7 +126,6 @@ page = st.sidebar.selectbox(
 st.sidebar.title("Filters")
 rider_opt = st.sidebar.radio("Rider type", ["All", "member", "casual"], index=0)
 topN = st.sidebar.slider("Top N stations", 10, 40, 20, 2)
-smooth_checkbox_default = True  # default smoothing
 
 # Date range (global)
 default_range = (MIN_DATE, MAX_DATE)
@@ -131,19 +144,25 @@ dff = df if rider_opt == "All" else df[df["member_casual"] == rider_opt]
 mask = (dff["date"].dt.date >= START_DATE) & (dff["date"].dt.date <= END_DATE)
 dff = dff.loc[mask].copy()
 
+
 # ---------------- KPI Strip (global) ----------------
 def kpi_strip(d):
     c1, c2, c3, c4, c5 = st.columns(5)
     total_trips = len(d)
-    avg_tempC = (d["avgTempC"].mean() if "avgTempC" in d.columns else np.nan)
+    # Use the GLOBAL temp table so KPI isn't biased by trip volume
+    tr = TEMP_DAILY[
+        (TEMP_DAILY["date"].dt.date >= START_DATE) & (TEMP_DAILY["date"].dt.date <= END_DATE)
+    ]
+    avg_tempC = tr["avgTempC"].mean() if not tr.empty else np.nan
+
     member_share = (
         (d["member_casual"].eq("member").mean() * 100.0)
         if "member_casual" in d.columns else np.nan
     )
-    top_station = (
-        d["start_station_name"].mode().iat[0]
-        if "start_station_name" in d.columns and not d["start_station_name"].empty else "—"
-    )
+    if "start_station_name" in d.columns and not d["start_station_name"].dropna().empty:
+        top_station = d["start_station_name"].mode().iat[0]
+    else:
+        top_station = "—"
 
     # Prior window comparison (simple)
     days = max((END_DATE - START_DATE).days + 1, 1)
@@ -161,6 +180,7 @@ def kpi_strip(d):
     c3.metric("Avg Temp (°C)", f"{avg_tempC:.1f}" if not np.isnan(avg_tempC) else "—")
     c4.metric("Member share", f"{member_share:.1f}%" if not np.isnan(member_share) else "—")
     c5.metric("Top start station", top_station)
+
 
 # ---------------- Helper functions ----------------
 def aggregate_flows(d, month=None, quantile=0.95):
@@ -184,6 +204,7 @@ def aggregate_flows(d, month=None, quantile=0.95):
         return grp, None
     thr = grp["trip_count"].quantile(quantile)
     return grp[grp["trip_count"] >= thr].reset_index(drop=True), thr
+
 
 def folium_map_from_flows(flows):
     if flows.empty:
@@ -227,6 +248,7 @@ def folium_map_from_flows(flows):
     LayerControl().add_to(m)
     return m
 
+
 def station_imbalance(d):
     """Starts minus Ends per station (net exporters/importers)."""
     s = d.groupby("start_station_name").size().rename("starts")
@@ -237,11 +259,13 @@ def station_imbalance(d):
     z.rename(columns={"index": "station"}, inplace=True)
     return z
 
+
 def is_waterfront_station(lon):
     """Very rough heuristic: NYC shoreline lon bands."""
     if pd.isna(lon):
         return False
     return (lon <= -74.02) or (lon >= -73.94)
+
 
 def decision_helper(d):
     """Compute simple, explainable recommendations from the filtered data."""
@@ -296,6 +320,7 @@ def decision_helper(d):
 
     return out
 
+
 # ---------------- Pages ----------------
 def page_intro():
     st.title("NYC Citi Bike — 2022 Dashboard (Final)")
@@ -314,30 +339,39 @@ def page_intro():
         """
     )
 
+
 def page_trends():
     st.header("Trends: Daily Trips vs Temperature (Data-driven)")
 
-    # Use the globally filtered dataframe dff (set by your sidebar filters)
     if dff.empty:
         st.warning("No rows match the current filters.")
         return
 
     # ---- Aggregate daily trips from the filtered slice ----
-    daily_trips = (
-        dff.groupby("date")
-           .size()
-           .rename("trip_count")
-           .reset_index()
+    trips_daily = (
+        dff.groupby(dff["date"].dt.date).size().rename("trip_count").reset_index()
+        .rename(columns={"date": "day"})
     )
-    # One temperature per day (already attached to trips); dedupe per date
-    temps = (
-        dff[["date", "avgTempC"]]
-        .dropna(subset=["date"])
-        .drop_duplicates(subset=["date"])
+    trips_daily["date"] = pd.to_datetime(trips_daily["day"])
+    trips_daily = trips_daily.drop(columns=["day"])
+
+    # ---- Get GLOBAL daily temps for the selected date range ----
+    temp_range = TEMP_DAILY[
+        (TEMP_DAILY["date"].dt.date >= START_DATE) & (TEMP_DAILY["date"].dt.date <= END_DATE)
+    ].copy()
+
+    # ---- Build a continuous calendar range and merge both ----
+    full_range = pd.DataFrame({
+        "date": pd.date_range(start=pd.to_datetime(START_DATE), end=pd.to_datetime(END_DATE), freq="D")
+    })
+    daily = (
+        full_range
+        .merge(trips_daily, on="date", how="left")
+        .merge(temp_range, on="date", how="left")
+        .sort_values("date")
+        .reset_index(drop=True)
     )
-    daily = (daily_trips.merge(temps, on="date", how="left")
-                       .sort_values("date")
-                       .reset_index(drop=True))
+    daily["trip_count"] = daily["trip_count"].fillna(0).astype(int)
 
     # ---- Smoothing toggle ----
     smooth_on = st.checkbox("Apply 7-day smoothing", value=True)
@@ -355,10 +389,12 @@ def page_trends():
         temp_label  = "Avg Temp (°C, daily)"
 
     # ---- Correlation & seasonality stats (based on current filtered view) ----
-    corr = (daily[[y_trips, y_temp]].dropna().corr().iloc[0,1]
-            if daily[y_temp].notna().any() else np.nan)
+    if daily[y_temp].notna().any():
+        corr = daily[[y_trips, y_temp]].dropna().corr().iloc[0, 1]
+    else:
+        corr = np.nan
 
-    daily["month"] = pd.to_datetime(daily["date"]).dt.month
+    daily["month"] = daily["date"].dt.month
     winter = daily[daily["month"].isin([11,12,1,2,3,4])]
     summer = daily[daily["month"].isin([5,6,7,8,9,10])]
     winter_avg = float(winter["trip_count"].mean()) if not winter.empty else np.nan
@@ -371,10 +407,11 @@ def page_trends():
         x=daily["date"], y=daily[y_trips],
         name=trips_label, mode="lines"
     ))
-    fig.add_trace(go.Scatter(
-        x=daily["date"], y=daily[y_temp],
-        name=temp_label, mode="lines", yaxis="y2"
-    ))
+    if daily[y_temp].notna().any():
+        fig.add_trace(go.Scatter(
+            x=daily["date"], y=daily[y_temp],
+            name=temp_label, mode="lines", yaxis="y2"
+        ))
     fig.update_layout(
         title="Daily Trips vs Temperature",
         xaxis=dict(title="Date", rangeslider=dict(visible=True)),
@@ -392,9 +429,14 @@ def page_trends():
     c3.metric("Avg daily trips (May–Oct)", "—" if np.isnan(summer_avg) else f"{int(round(summer_avg)):,}")
     c4.metric("Winter/Summer ratio", "—" if np.isnan(ratio) else f"{ratio:.2f}")
 
+
 def page_stations_top():
     st.header(f"Top Starting Stations  —  {'all riders' if rider_opt=='All' else rider_opt}")
     kpi_strip(dff)
+
+    if "start_station_name" not in dff.columns or dff.empty:
+        st.warning("No station data available for the current filters.")
+        return
 
     vc = dff["start_station_name"].value_counts().head(topN).sort_values(ascending=True)
     fig = px.bar(
@@ -405,9 +447,14 @@ def page_stations_top():
     fig.update_layout(height=620, margin=dict(t=10, b=20, l=160, r=20), showlegend=False, bargap=0.2)
     st.plotly_chart(fig, use_container_width=True)
 
+
 def page_stations_imbalance():
     st.header(f"Stations Imbalance (starts − ends)  —  {'all riders' if rider_opt=='All' else rider_opt}")
     kpi_strip(dff)
+
+    if dff.empty:
+        st.warning("Not enough data to compute imbalance.")
+        return
 
     z = station_imbalance(dff)  # columns: ['station','starts','ends','net']
     if z.empty:
@@ -438,12 +485,17 @@ def page_stations_imbalance():
         fig2.update_layout(height=500, margin=dict(l=160, r=20, t=20, b=20), showlegend=False)
         st.plotly_chart(fig2, use_container_width=True)
 
+
 def page_map_inline():
     st.header("Origin → Destination Flows (Inline Folium)")
     kpi_strip(dff)
 
     if not HAS_FOLIUM:
         st.error("Folium is not installed. In your venv, run:  pip install folium")
+        return
+
+    if dff.empty:
+        st.warning("No data for map under current filters.")
         return
 
     # Controls
@@ -465,6 +517,7 @@ def page_map_inline():
     html = m.get_root().render()
     components.html(html, height=900, scrolling=True)
     st.caption(f"Showing flows ≥ {int(thr) if thr is not None else 'threshold'} trips (quantile={quant:.2f}).")
+
 
 def page_map_embedded():
     st.header("Origin → Destination Flows (Embedded HTML)")
@@ -495,9 +548,14 @@ def page_map_embedded():
     except Exception as e:
         st.error(f"Failed to load {map_file.name}: {e}")
 
+
 def page_bonus():
     st.header("Bonus: Rider Mix by Month")
     kpi_strip(dff)
+
+    if dff.empty:
+        st.warning("No data for the current filters.")
+        return
 
     d2 = dff.copy()
     d2["month"] = d2["date"].dt.to_period("M").astype(str)
@@ -506,6 +564,7 @@ def page_bonus():
     fig = px.area(mix, x="month", y="trips", color="member_casual", category_orders={"month":order})
     fig.update_layout(height=520, margin=dict(t=10, b=20, l=40, r=20), legend_title_text="Rider type")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def page_decision_helper():
     st.header("Decision Helper — From Data to Actions")
@@ -567,6 +626,7 @@ def page_decision_helper():
         with st.expander("Debug (raw helper object)"):
             st.write(out)
 
+
 def page_recommendations():
     st.header("Recommendations (Summary)")
     kpi_strip(dff)
@@ -591,6 +651,7 @@ def page_recommendations():
         - Track KPIs post-change (stock-outs, lost-trip rate, bike-minute utilization).
         """
     )
+
 
 # ---------------- Route to selected page ----------------
 if page == "Intro":
